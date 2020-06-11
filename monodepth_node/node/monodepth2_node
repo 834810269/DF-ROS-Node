@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+#!coding=utf-8
+import os
+#import matplotlib.pyplot as plt # wang
+import numpy as np
+import rospy
+import math
+import cv_bridge
+from sensor_msgs.msg import Image
+import models
+import torch
+from utils import tensor2array, disp_to_depth
+import PIL.Image as pil
+from torchvision import transforms, datasets
+#import seaborn as sns # wang
+
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+torch.set_grad_enabled(False) # make sure to not compute gradients for computational performance
+if torch.cuda.is_available():
+    torch.backends.cudnn.enabled = True # make sure to use cudnn for computational performance
+
+def image_callback(msg): # for depth
+    rospy.loginfo("=> Received one imageframe")
+    image_callback.last_image = msg
+image_callback.last_image = None
+
+if __name__ == "__main__":
+    print("=====> depth recover start <=====")
+    rospy.init_node('depth_recover_node')
+
+    MODEL = rospy.get_param('~model', 'Monodepth2')
+    DISP_MODEL_PATH = rospy.get_param('~depth_model_path', '/home/wang/ROS_WS/pytorch_ws/src/monodepth_node/pretrained/1024_320/')
+    TOPIC_IMAGE = rospy.get_param('~topic_image', '/kitti/camera_color_left/image_raw') # '/pose_graph/keyframe_image'topic of input images
+
+    TOPIC_GRAY_IMAGE = rospy.get_param('~topic_gray_image', '/depth_node/reference_image') # topic of output depth for visulizatioin
+    TOPIC_DEPTH_VIEW = rospy.get_param('~topic_depth_view', '/depth_node/depth_image_view') # topic of output depth for visulizatioin
+    TOPIC_DISP_VIEW = rospy.get_param('~topic_disp_view', '/depth_node/disp_image_view') # topic of output disp for visulizatioin
+    TOPIC_DEPTH = rospy.get_param('~topic_depth', '/depth_node/depth_image') # topic of output raw depth
+
+    sub_image = rospy.Subscriber(TOPIC_IMAGE, Image, image_callback)
+    pub_gray_image = rospy.Publisher(TOPIC_GRAY_IMAGE, Image, queue_size = 1)
+    pub_depth_view = rospy.Publisher(TOPIC_DEPTH_VIEW, Image, queue_size = 1)
+    pub_disp_view = rospy.Publisher(TOPIC_DISP_VIEW, Image, queue_size = 1)
+    pub_depth = rospy.Publisher(TOPIC_DEPTH, Image, queue_size = 1)
+
+    rate = rospy.Rate(30.0)
+
+    print("=> using device: ",format(device))
+    print("=> Loading model from: ",format(DISP_MODEL_PATH))
+    print("=> dispnet model: ", format(MODEL))
+    
+    # PATH
+    print("=> creating model")
+    encoder_path = DISP_MODEL_PATH + "encoder.pth"
+    depth_decoder_path = DISP_MODEL_PATH + "depth.pth"
+    # ENCODER
+    print("=> Loading encoder")
+    encoder = models.ResnetEncoder(18, False)
+    loaded_dict_enc = torch.load(encoder_path, map_location=device)
+    feed_height = loaded_dict_enc['height']
+    feed_width = loaded_dict_enc['width']
+    filtered_dict_enc = {k: v for k, v in loaded_dict_enc.items() if k in encoder.state_dict()}
+    encoder.load_state_dict(filtered_dict_enc)
+    encoder.to(device)
+    encoder.eval()
+    # DECODER
+    print("=> Loading decoder")
+    depth_decoder = models.DepthDecoder(num_ch_enc=encoder.num_ch_enc, scales=range(4))
+    loaded_dict = torch.load(depth_decoder_path, map_location=device)
+    depth_decoder.load_state_dict(loaded_dict)
+    depth_decoder.to(device)
+    depth_decoder.eval()
+    print("=> feed height: ", feed_height, ", feed width: ", feed_width)
+    print("=> Waiting for data")
+
+    while not rospy.is_shutdown():
+
+        rate.sleep()
+
+        if image_callback.last_image is None:
+            continue
+
+        cur_msg = image_callback.last_image
+        header = cur_msg.header
+        img = cv_bridge.imgmsg_to_cv2(cur_msg,desired_encoding='rgb8')
+        h, w, c = img.shape
+
+        img = pil.fromarray(img)
+        img = img.resize((feed_width, feed_height)) # pil.LANCZOS pil.NEAREST, pil.BOX, pil.BILINEAR, pil.HAMMING, pil.BICUBIC or pil.LANCZOS
+
+        gray_img = np.asarray(img)
+        #print(gray_img.shape)
+        gray_img = cv_bridge.color2graymsg(gray_img)
+        gray_img.header.stamp.secs = header.stamp.secs
+        gray_img.header.stamp.nsecs = header.stamp.nsecs
+        pub_gray_image.publish(gray_img)
+
+        
+        input_image = transforms.ToTensor()(img).unsqueeze(0) # [0, 1] [1, C, H, W]
+        
+        # print("=> inference")
+        input_image = input_image.to(device)
+        # print("=> input image size: ",input_image.size())
+        features = encoder(input_image)
+        outputs = depth_decoder(features)
+        output_disp = outputs[("disp", 0)]
+        # output_disp = torch.nn.functional.interpolate(disp, (h, w), mode="bilinear", align_corners=False)
+        # print("=> output image size: ", output_disp.size())
+        scaled_disp, output_depth = disp_to_depth(output_disp, 0.1, 100)
+        # print("=> Done! ")
+
+
+        disp_view = (255 * tensor2array(scaled_disp, max_value=None, colormap='magma')).astype(np.uint8) # [c, h, w]
+        m_disp_view = cv_bridge.cv2_to_imgmsg(np.transpose(disp_view, (1, 2, 0))[:,:,2::-1])
+        m_disp_view.header.stamp.secs = header.stamp.secs
+        m_disp_view.header.stamp.nsecs = header.stamp.nsecs
+        pub_disp_view.publish(m_disp_view)
+
+        depth_view = (255 * tensor2array(output_depth, max_value=None, colormap='rainbow')).astype(np.uint8)
+        m_depth_view = cv_bridge.cv2_to_imgmsg(np.transpose(depth_view, (1, 2, 0))[:,:,2::-1])
+        m_depth_view.header.stamp.secs = header.stamp.secs
+        m_depth_view.header.stamp.nsecs = header.stamp.nsecs
+        pub_depth_view.publish(m_depth_view)
+
+        depth_infer = output_depth.detach().cpu().squeeze().numpy()
+        m_depth = cv_bridge.depth_to_imgmsg(depth_infer)
+        m_depth.header.stamp.secs = header.stamp.secs
+        m_depth.header.stamp.nsecs = header.stamp.nsecs
+        pub_depth.publish(m_depth)
+        #rospy.spin()
+
+
+
+
+
+

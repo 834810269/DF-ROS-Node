@@ -1,0 +1,13 @@
+CMakeLists.txt
+.idea/
+monodepth_node/pretrained/
+flow_pred/pretrained/
+depth_recover/pretrained/
+depth_recover/.idea/
+depth_recover/node/__pycache__/
+flow_pred/node/__pycache__/
+flow_pred/node/models/__pycache__/
+depth_recover/node/models/__pycache__/
+flow_pred/node/models/flow_net/__pycache__/
+monodepth_node/node/__pycache__/
+monodepth_node/node/models/__pycache__/

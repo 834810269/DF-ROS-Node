@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+#!coding=utf-8
+import PIL.Image as pil
+import numpy as np
+import rospy
+import math
+import cv_bridge
+from sensor_msgs.msg import Image
+import models
+import torch
+from utils import tensor2array_flow
+
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+torch.set_grad_enabled(False) # make sure to not compute gradients for computational performance
+if torch.cuda.is_available():
+    torch.backends.cudnn.enabled = True # make sure to use cudnn for computational performance
+
+def image_flow_callback(msg): # for flow
+    #rospy.loginfo("=> Received one imageframe")
+    image_flow_callback.last_image.append(msg)
+image_flow_callback.last_image = list()
+
+sampler = 32.0
+
+def inferflow(tensorFirst, tensorSecond, flownet):
+    assert(tensorFirst.size(2)==tensorSecond.size(2))
+    assert(tensorFirst.size(3)==tensorSecond.size(3))
+
+    intWidth = tensorFirst.size(3)
+    intHeight = tensorFirst.size(2)
+
+    intPreprocessedWidth = int(math.floor(math.ceil(intWidth / sampler) * sampler))
+    intPreprocessedHeight = int(math.floor(math.ceil(intHeight / sampler) * sampler))
+
+    tensorPreprocessedFirst = torch.nn.functional.interpolate(input=tensorFirst,
+                                                              size=(intPreprocessedHeight, intPreprocessedWidth),
+                                                              mode='bilinear', align_corners=False)
+    tensorPreprocessedSecond = torch.nn.functional.interpolate(input=tensorSecond,
+                                                               size=(intPreprocessedHeight, intPreprocessedWidth),
+                                                               mode='bilinear', align_corners=False)
+
+    tensorFlow = torch.nn.functional.interpolate(input=flownet(tensorPreprocessedFirst, tensorPreprocessedSecond),
+                                                 size=(intHeight, intWidth), mode='bilinear', align_corners=False)
+
+    tensorFlow[:, 0, :, :] *= float(intWidth) / float(intPreprocessedWidth)
+    tensorFlow[:, 1, :, :] *= float(intHeight) / float(intPreprocessedHeight)
+
+    return tensorFlow[0]
+
+if __name__ == "__main__":
+    print("=====> flow prediction start <=====")
+    rospy.init_node('flow_prediction_node')
+
+    MODEL = rospy.get_param('~model', 'LiteFlowNet')
+    FLOW_MODEL_PATH = rospy.get_param('~flow_model_path', '/home/wang/ROS_WS/pytorch_ws/src/flow_pred/pretrained/LiteFlowNet-kitti.pytorch')
+    TOPIC_IMAGE_FLOW = rospy.get_param('~topic_image_flow', '/kitti/camera_color_left/image_raw') # topic of input images
+
+    TOPIC_FLOW_VIEW = rospy.get_param('~topic_flow_view', '/flow_node/flow_image_view') # topic of output flow for view
+    TOPIC_FLOW = rospy.get_param('~topic_flow', '/flow_node/flow_image') # topic of output raw flow
+
+    feed_width = rospy.get_param('~feed_width', 640) # the width of image
+    feed_height = rospy.get_param('~feed_height', 192) # the width of image 
+
+    sub_image_flow = rospy.Subscriber(TOPIC_IMAGE_FLOW, Image, image_flow_callback)
+
+    pub_flow_view = rospy.Publisher(TOPIC_FLOW_VIEW, Image, queue_size = 1)
+    pub_flow = rospy.Publisher(TOPIC_FLOW, Image, queue_size = 1)
+
+    rate = rospy.Rate(30.0)
+
+    print("=> creating model")
+    print("=> using device: ",format(device))
+
+    print("=> flownet model: ", format(MODEL))
+    print("=> using pre-trained weights for FlowNet")
+    flow_net = getattr(models, MODEL)().to(device)
+    weights = torch.load(FLOW_MODEL_PATH)
+    flow_net.load_state_dict(weights)
+    flow_net.eval()
+
+    if MODEL == 'LiteFlowNet' or MODEL == 'SpyNet':
+        sampler = 32.0
+    else:
+        sampler = 64.0
+    print("=> Sampler: ", format(sampler))
+    print("=> feed width: ",feed_width, " feed height: ",feed_height )
+    while not rospy.is_shutdown():
+
+        rate.sleep()
+
+        if len(image_flow_callback.last_image) <= 1:
+            continue
+
+        cur_msg = image_flow_callback.last_image.pop(0)
+        for_msg = image_flow_callback.last_image[0]
+
+        header = cur_msg.header
+
+        img = cv_bridge.imgmsg_to_cv2(cur_msg,desired_encoding='rgb8')
+        img = pil.fromarray(img)
+        img = img.resize((feed_width, feed_height))#, pil.LANCZOS)
+        img = np.asarray(img)
+
+        img_for = cv_bridge.imgmsg_to_cv2(for_msg,desired_encoding='rgb8')
+        img_for = pil.fromarray(img_for)
+        img_for = img_for.resize((feed_width, feed_height))#, pil.LANCZOS)
+        img_for = np.asarray(img_for)
+
+        assert(img.shape==img_for.shape)
+        # print(img.shape,"   ",img_for.shape)
+        h, w, c = img.shape
+
+        img = np.transpose(img, (2, 0, 1)) # [C, H, W]
+        img_for = np.transpose(img_for, (2, 0, 1)) # [C, H, W]
+        # for flownet
+        tensorFirst = torch.from_numpy(img.copy()).unsqueeze(0).float() # [1, C ,H, W]
+        tensorFirst = (tensorFirst / 255.0).to(device)
+        # print("tensorfirst size",tensorFirst.size())
+        tensorSecond = torch.from_numpy(img_for.copy()).unsqueeze(0).float()
+        tensorSecond = (tensorSecond / 255.0).to(device)
+        # print("tensorsecond size",tensorSecond.size())
+
+        #print("=> inference")
+        output_flow = inferflow(tensorFirst, tensorSecond, flow_net)
+        rospy.loginfo("=> generate one imageframe")
+        #print("=> Done! ")
+
+        flow_view = tensor2array_flow(output_flow).astype(np.uint8)
+        m_flow_view = cv_bridge.cv2_to_imgmsg(np.transpose(flow_view, (1, 2, 0))[:,:,::-1])
+        m_flow_view.header.stamp.secs = header.stamp.secs
+        m_flow_view.header.stamp.nsecs = header.stamp.nsecs
+        pub_flow_view.publish(m_flow_view)
+        
+        flow_infer = output_flow.detach().cpu().squeeze().numpy()
+        #print("=> numpy shape",flow_infer.shape)
+        #print("=> numpy dtype",flow_infer.dtype)
+        m_flow = cv_bridge.flow_to_imgmsg(np.transpose(flow_infer, (1, 2, 0)))
+        m_flow.header.stamp.secs = header.stamp.secs
+        m_flow.header.stamp.nsecs = header.stamp.nsecs
+        pub_flow.publish(m_flow)
+
+
+
+
